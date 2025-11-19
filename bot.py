@@ -10,13 +10,9 @@ CryptoBot MARGIN x5 (REST anti-ban + auto-ajuste LOT_SIZE/minQty)
 - Vende con sideEffectType='AUTO_REPAY' (repaga automáticamente el préstamo).
 - Ajusta la cantidad a LOT_SIZE / minQty / minNotional para evitar errores -1013.
 
-REQUISITOS:
-    pip install python-binance
-
-IMPORTANTE:
-    - Activa la cuenta de Margin en Binance.
-    - Activa los pares en Margin y configura el apalancamiento (x5).
-    - Rellena API_KEY y API_SECRET con tus claves reales (SPOT/MARGIN).
+VERSIÓN ANTI-RESTOS:
+- En la venta, intenta vender el 100% del balance en ese par, repitiendo ventas
+  hasta que Binance ya no permite más (por minNotional/minQty).
 """
 
 import time
@@ -139,6 +135,9 @@ def ajustar_qty_desde_capital(client: Client, symbol: str, capital_usdc: float, 
 
 
 def ajustar_qty_desde_balance_margin(client: Client, symbol: str, balance_qty: float, price: float):
+    """
+    Ajusta la cantidad a vender en margin, según el balance de la alt en margin.
+    """
     min_qty, step_size, min_notional = get_symbol_filters(client, symbol)
 
     if balance_qty <= 0:
@@ -197,7 +196,7 @@ def elegir_mejor_symbol(client: Client):
             score = obtener_score_15m(client, symbol)
             logger.info(f"Score 15m {symbol}: {score:.3f}%")
 
-            if score > mejor_score:  # AHORA ELIGE LA MEJOR
+            if score > mejor_score:  # ELIGE LA MEJOR
                 mejor_score = score
                 mejor_symbol = symbol
 
@@ -246,33 +245,60 @@ def comprar_symbol_margin(client: Client, symbol: str, saldo_usdc_margin_free: f
 
 
 def vender_symbol_margin(client: Client, symbol: str):
+    """
+    Vende en margin intentando eliminar TODO el saldo de esa alt.
+    - Repite ventas mientras:
+        * haya saldo
+        * se pueda cumplir LOT_SIZE / minQty / minNotional
+    - Si queda un resto tan pequeño que Binance no permite venderlo, lo deja
+      (serán céntimos) y lo registra en el log.
+    """
     base = symbol.replace(QUOTE_ASSET, "")
-    saldo_base_margin = obtener_saldo_margin(client, base)
+    ultimo_order = None
+    intento = 0
 
-    if saldo_base_margin <= 0:
-        return None
+    while True:
+        intento += 1
+        saldo_base_margin = obtener_saldo_margin(client, base)
 
-    price = obtener_precio(client, symbol)
-    qty = ajustar_qty_desde_balance_margin(client, symbol, saldo_base_margin, price)
+        if saldo_base_margin <= 0:
+            if ultimo_order is None:
+                logger.warning(f"No hay saldo MARGIN para vender en {symbol}.")
+                return None
+            else:
+                logger.info(f"Venta completada: no queda saldo significativo en {base}.")
+                return ultimo_order
 
-    if qty is None:
-        return None
+        price = obtener_precio(client, symbol)
+        qty = ajustar_qty_desde_balance_margin(client, symbol, saldo_base_margin, price)
 
-    logger.info(f"VENDIENDO MARGIN {symbol} qty={qty:.8f} (≈ {qty*price:.4f} USDC)")
+        if qty is None:
+            valor_restante = saldo_base_margin * price
+            logger.info(
+                f"Queda un resto pequeño en {base}: saldo≈{saldo_base_margin:.8f}, "
+                f"valor≈{valor_restante:.4f} {QUOTE_ASSET}. "
+                f"Binance no permite venderlo (por debajo de LOT_SIZE/minNotional)."
+            )
+            return ultimo_order
 
-    try:
-        order = client.create_margin_order(
-            symbol=symbol,
-            side=SIDE_SELL,
-            type=ORDER_TYPE_MARKET,
-            quantity=qty,
-            sideEffectType="AUTO_REPAY"
+        logger.info(
+            f"[Intento {intento}] VENDIENDO MARGIN {symbol} qty={qty:.8f} "
+            f"(≈ {qty * price:.4f} {QUOTE_ASSET}) con AUTO_REPAY"
         )
-        return order
 
-    except Exception as e:
-        logger.error(f"Error SELL {symbol}: {e}")
-        return None
+        try:
+            order = client.create_margin_order(
+                symbol=symbol,
+                side=SIDE_SELL,
+                type=ORDER_TYPE_MARKET,
+                quantity=qty,
+                sideEffectType="AUTO_REPAY"
+            )
+            ultimo_order = order
+
+        except Exception as e:
+            logger.error(f"Error SELL {symbol} en intento {intento}: {e}")
+            return ultimo_order
 
 
 # ============================
@@ -280,7 +306,7 @@ def vender_symbol_margin(client: Client, symbol: str):
 # ============================
 
 def main():
-    logger.info("Iniciando CryptoBot MARGIN x5 (versión fuerza 15m)")
+    logger.info("Iniciando CryptoBot MARGIN x5 (versión fuerza 15m, anti-restos)")
 
     client = Client(API_KEY, API_SECRET)
     symbol_actual, entry_price = detectar_posicion_actual_margin(client)
@@ -304,7 +330,10 @@ def main():
                 price_now = obtener_precio(client, symbol_actual)
                 pnl_pct = (price_now / entry_price - 1.0) * 100.0
 
-                logger.info(f"Actual {symbol_actual} | Entry={entry_price:.8f} | Now={price_now:.8f} | PnL={pnl_pct:.3f}%")
+                logger.info(
+                    f"Actual {symbol_actual} | Entry={entry_price:.8f} | "
+                    f"Now={price_now:.8f} | PnL={pnl_pct:.3f}%"
+                )
 
                 if pnl_pct >= TAKE_PROFIT:
                     vender_symbol_margin(client, symbol_actual)
