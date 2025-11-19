@@ -39,7 +39,7 @@ def env_str(name, default=""):
 
 
 # ============================================================
-# CONFIG (MARGEN X5)
+# CONFIG (MARGEN X5 + TIMEFRAME)
 # ============================================================
 
 QUOTE_ASSET = "USDC"
@@ -51,6 +51,10 @@ LIVE_TRADING = env_bool("LIVE_TRADING", False)
 USE_MARGIN = True
 MARGIN_LEVERAGE = 5
 MARGIN_MODE = "cross"
+
+# ⏱️ TIMEFRAME para las velas de análisis (1h por defecto)
+# Valores típicos válidos: "1m", "5m", "15m", "30m", "1h", "4h"...
+TIMEFRAME = env_str("TIMEFRAME", "1h")
 
 # ============================================================
 # BINANCE WRAPPER
@@ -68,7 +72,8 @@ class BinanceWrapper:
             f"SECRET_SET={bool(api_secret)} "
             f"TESTNET={use_testnet} "
             f"USE_MARGIN={USE_MARGIN} "
-            f"LEVERAGE={MARGIN_LEVERAGE}"
+            f"LEVERAGE={MARGIN_LEVERAGE} "
+            f"TIMEFRAME={TIMEFRAME}"
         )
 
         if not api_key or not api_secret:
@@ -117,16 +122,21 @@ class BinanceWrapper:
         return 0.0
 
     # -----------------------------
-    # CHANGE 1H
+    # CHANGE PCT (TIMEFRAME CONFIGURABLE)
     # -----------------------------
 
-    def change_1h(self, symbol):
+    def change_pct(self, symbol, interval=None):
+        if interval is None:
+            interval = TIMEFRAME
         try:
-            kl = self.client.get_klines(symbol=symbol, interval="1h", limit=2)
+            kl = self.client.get_klines(symbol=symbol, interval=interval, limit=2)
+            if len(kl) < 2:
+                return 0.0
             prev = float(kl[0][4])
             last = float(kl[1][4])
             return (last - prev) / prev * 100
-        except:
+        except Exception as e:
+            logger.error(f"Error obteniendo cambio para {symbol} en {interval}: {e}")
             return 0.0
 
     # -----------------------------
@@ -136,10 +146,15 @@ class BinanceWrapper:
     def buy(self, symbol, amount_usdc):
         px = self.price(symbol)
         if px == 0:
+            logger.warning(f"Precio 0 en {symbol}, no compro.")
             return
 
         # x5 de margen
         qty = round(amount_usdc / px * MARGIN_LEVERAGE, 6)
+
+        if qty <= 0:
+            logger.warning(f"Cantidad calculada 0 en BUY {symbol}, amount_usdc={amount_usdc}")
+            return
 
         if USE_MARGIN:
             if LIVE_TRADING:
@@ -151,6 +166,7 @@ class BinanceWrapper:
                         quantity=qty,
                         sideEffectType="MARGIN_BUY"
                     )
+                    logger.info(f"[REAL MARGIN X5] BUY {qty} {symbol}")
                 except BinanceAPIException as e:
                     logger.error(e)
             else:
@@ -159,6 +175,7 @@ class BinanceWrapper:
             if LIVE_TRADING:
                 try:
                     self.client.order_market_buy(symbol=symbol, quantity=qty)
+                    logger.info(f"[REAL SPOT] BUY {qty} {symbol}")
                 except BinanceAPIException as e:
                     logger.error(e)
             else:
@@ -174,6 +191,7 @@ class BinanceWrapper:
         if USE_MARGIN:
             qty = self.margin_balance(asset)
             if qty <= 0:
+                logger.warning(f"No hay balance margin en {asset} para vender.")
                 return
             if LIVE_TRADING:
                 try:
@@ -184,6 +202,7 @@ class BinanceWrapper:
                         quantity=qty,
                         sideEffectType="AUTO_REPAY"
                     )
+                    logger.info(f"[REAL MARGIN X5] SELL {qty} {symbol}")
                 except BinanceAPIException as e:
                     logger.error(e)
             else:
@@ -191,10 +210,12 @@ class BinanceWrapper:
         else:
             qty = self.spot_balance(asset)
             if qty <= 0:
+                logger.warning(f"No hay balance spot en {asset} para vender.")
                 return
             if LIVE_TRADING:
                 try:
                     self.client.order_market_sell(symbol=symbol, quantity=qty)
+                    logger.info(f"[REAL SPOT] SELL {qty} {symbol}")
                 except BinanceAPIException as e:
                     logger.error(e)
             else:
@@ -211,7 +232,7 @@ class CryptoBot:
         self.current = f"BTC{QUOTE_ASSET}"
 
     def run(self):
-        logger.info("=== CICLO NUEVO ===")
+        logger.info(f"=== CICLO NUEVO (TIMEFRAME={TIMEFRAME}) ===")
 
         # 🔥 Universo seguro de monedas USDC con buen margin
         universe = [
@@ -234,8 +255,8 @@ class CryptoBot:
         best_ch = -999
 
         for s in universe:
-            ch = self.binance.change_1h(s)
-            logger.info(f"{s}: {ch:.2f}%")
+            ch = self.binance.change_pct(s)
+            logger.info(f"{s}: {ch:.2f}% ({TIMEFRAME})")
             if ch > best_ch:
                 best_ch = ch
                 best = s
@@ -258,7 +279,7 @@ class CryptoBot:
 if __name__ == "__main__":
     logger.info("Iniciando CryptoBot con MARGEN X5 y universo seguro USDC")
     logger.info(f"Trading real: {LIVE_TRADING}")
-    logger.info(f"MARGEN ACTIVADO = {USE_MARGIN}, LEVERAGE = {MARGIN_LEVERAGE}")
+    logger.info(f"MARGEN ACTIVADO = {USE_MARGIN}, LEVERAGE = {MARGIN_LEVERAGE}, TIMEFRAME={TIMEFRAME}")
 
     bot = CryptoBot()
 
