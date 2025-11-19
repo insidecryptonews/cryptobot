@@ -39,7 +39,7 @@ def env_str(name, default=""):
 
 
 # ============================================================
-# CONFIG (MARGEN X5 + TIMEFRAME)
+# CONFIG (MARGEN X5 + TIMEFRAME + UMBRAL)
 # ============================================================
 
 QUOTE_ASSET = "USDC"
@@ -55,6 +55,11 @@ MARGIN_MODE = "cross"
 # ⏱️ TIMEFRAME para las velas de análisis (1h por defecto)
 # Valores típicos válidos: "1m", "5m", "15m", "30m", "1h", "4h"...
 TIMEFRAME = env_str("TIMEFRAME", "1h")
+
+# 🔍 UMBRAL MÍNIMO PARA CAMBIAR DE MONEDA (en % de diferencia)
+# Si la mejor moneda no mejora al menos este % respecto a la actual, NO cambiamos.
+EDGE_MIN_DIFF = 0.20  # 0.20%
+
 
 # ============================================================
 # BINANCE WRAPPER
@@ -73,7 +78,8 @@ class BinanceWrapper:
             f"TESTNET={use_testnet} "
             f"USE_MARGIN={USE_MARGIN} "
             f"LEVERAGE={MARGIN_LEVERAGE} "
-            f"TIMEFRAME={TIMEFRAME}"
+            f"TIMEFRAME={TIMEFRAME} "
+            f"EDGE_MIN_DIFF={EDGE_MIN_DIFF}"
         )
 
         if not api_key or not api_secret:
@@ -253,23 +259,42 @@ class CryptoBot:
 
         best = None
         best_ch = -999
+        current_ch = None
 
         for s in universe:
             ch = self.binance.change_pct(s)
             logger.info(f"{s}: {ch:.2f}% ({TIMEFRAME})")
+
+            if s == self.current:
+                current_ch = ch
+
             if ch > best_ch:
                 best_ch = ch
                 best = s
 
-        logger.info(f"Actual: {self.current} | Mejor: {best}")
+        # Si por alguna razón no se ha calculado current_ch (por ejemplo, current no está en universe),
+        # asumimos que es muy malo para obligar al cambio si best es decente.
+        if current_ch is None:
+            current_ch = -999
 
-        if best != self.current:
-            logger.info("CAMBIO DE MONEDA!")
+        diff = best_ch - current_ch
+        logger.info(
+            f"Actual: {self.current} ({current_ch:.2f}%) | Mejor: {best} ({best_ch:.2f}%) | Diff={diff:.2f}%"
+        )
+
+        # 🔍 Aplicamos el UMBRAL: solo cambiamos si la mejor mejora al menos EDGE_MIN_DIFF
+        if best != self.current and diff >= EDGE_MIN_DIFF:
+            logger.info(f"CAMBIO DE MONEDA! (Diff={diff:.2f}% >= {EDGE_MIN_DIFF:.2f}%)")
             self.binance.sell_all(self.current)
             # Usar balance según margen o spot
             bal = self.binance.margin_balance(QUOTE_ASSET) if USE_MARGIN else self.binance.spot_balance(QUOTE_ASSET)
             self.binance.buy(best, bal)
             self.current = best
+        else:
+            logger.info(
+                f"NO cambiamos de moneda. Diff={diff:.2f}% < {EDGE_MIN_DIFF:.2f}% "
+                f"o best == current."
+            )
 
 
 # ============================================================
@@ -277,9 +302,12 @@ class CryptoBot:
 # ============================================================
 
 if __name__ == "__main__":
-    logger.info("Iniciando CryptoBot con MARGEN X5 y universo seguro USDC")
+    logger.info("Iniciando CryptoBot con MARGEN X5, universo seguro USDC y UMBRAL de cambio")
     logger.info(f"Trading real: {LIVE_TRADING}")
-    logger.info(f"MARGEN ACTIVADO = {USE_MARGIN}, LEVERAGE = {MARGIN_LEVERAGE}, TIMEFRAME={TIMEFRAME}")
+    logger.info(
+        f"MARGEN ACTIVADO = {USE_MARGIN}, LEVERAGE = {MARGIN_LEVERAGE}, "
+        f"TIMEFRAME={TIMEFRAME}, EDGE_MIN_DIFF={EDGE_MIN_DIFF}"
+    )
 
     bot = CryptoBot()
 
