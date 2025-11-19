@@ -35,13 +35,14 @@ CYCLE_SECONDS = int(os.getenv("CYCLE_SECONDS", "60"))
 
 MIN_NOTIONAL_USD = float(os.getenv("MIN_NOTIONAL_USD", "5"))
 
-# ===================== STREAM DE PRECIOS =====================
+# ===================== STREAM =====================
 
 class PriceStream:
     """
-    Mantiene en memoria el % de cambio del último cierre de vela para cada símbolo.
-    Los WebSockets USDC a veces no envían datos, así que usamos SPOT USDT solo para precios.
+    FIX 1: WebSocket coge velas de USDT (SPOT) porque USDC no envía.
+    FIX 2: Guardamos los símbolos tal cual vengan (USDT).
     """
+
     def __init__(self, client: Client, symbols, interval: str):
         self.client = client
         self.symbols = symbols
@@ -51,6 +52,7 @@ class PriceStream:
         self._conns = []
 
     def _handle_kline(self, msg):
+
         if msg.get("e") == "error":
             logging.error("WebSocket error: %s", msg)
             return
@@ -63,7 +65,7 @@ class PriceStream:
         try:
             o = float(data["o"])
             c = float(data["c"])
-        except (KeyError, ValueError, TypeError):
+        except:
             return
 
         pct = (c - o) / o * 100.0
@@ -71,65 +73,55 @@ class PriceStream:
 
     def start(self):
         for sym in self.symbols:
-            # FIX: Websocket SPOT con USDT para recibir velas, sin cambiar trading
-            ws_symbol = sym.replace("USDC", "USDT")
-
+            ws_symbol = sym.replace("USDC", "USDT")  # <- FIX PRINCIPAL
             conn_key = self._bsm.start_kline_socket(
                 ws_symbol, self._handle_kline, interval=self.interval
             )
             self._conns.append(conn_key)
 
         self._bsm.start()
-        logging.info(
-            "WebSocket iniciado para %d símbolos (TIMEFRAME=%s)",
-            len(self.symbols), self.interval
-        )
+        logging.info("WebSocket iniciado con FIX para USDC/USDT")
 
     def stop(self):
         for key in self._conns:
             try:
                 self._bsm.stop_socket(key)
-            except Exception:
+            except:
                 pass
         self._bsm.close()
 
 
-# ===================== LÓGICA DE TRADING =====================
+# ===================== BOT =====================
 
 class CryptoBot:
     def __init__(self):
         if not API_KEY or not API_SECRET:
-            raise RuntimeError("Faltan BINANCE_API_KEY / BINANCE_API_SECRET")
+            raise RuntimeError("Faltan claves de Binance")
 
         self.client = Client(API_KEY, API_SECRET)
-
         self.symbols = SYMBOLS
         self.current_symbol = None
         self.stream = PriceStream(self.client, self.symbols, TIMEFRAME)
 
-        logging.info("Iniciando CryptoBot ANTI-BAN")
-        logging.info("Trading real: %s", TRADE_REAL)
-        logging.info("Margen activado: %s (x%s)", USE_MARGIN, LEVERAGE)
-        logging.info("Timeframe: %s | EDGE_MIN_DIFF: %.3f%%",
-                     TIMEFRAME, EDGE_MIN_DIFF)
+        logging.info("Iniciando CryptoBot ANTI-BAN + FIX USDC")
 
     def _get_margin_balances(self):
         try:
             acc = self.client.get_margin_account()
         except BinanceAPIException as e:
-            logging.error("Error al obtener cuenta de margen: %s", e)
+            logging.error("Error al obtener margin: %s", e)
             return 0.0, {}
 
         usdc_free = 0.0
         posiciones = {}
         for asset in acc.get("userAssets", []):
-            asset_name = asset.get("asset")
-            free = float(asset.get("free", "0"))
-            if asset_name == USDC_ASSET:
+            a = asset.get("asset")
+            free = float(asset.get("free", 0))
+            if a == USDC_ASSET:
                 usdc_free = free
             else:
                 if free > 0:
-                    posiciones[asset_name] = free
+                    posiciones[a] = free
         return usdc_free, posiciones
 
     def _round_step(self, quantity: float, step: str) -> float:
@@ -151,96 +143,109 @@ class CryptoBot:
                     pass
         return lot_step, min_notional
 
-    def _place_margin_market_sell(self, symbol: str, base_qty: float):
+    def _place_margin_market_sell(self, symbol, base_qty):
         if base_qty <= 0:
             return
         try:
             lot_step, _ = self._get_symbol_filters(symbol)
             qty_rounded = self._round_step(base_qty, lot_step)
+
             if qty_rounded <= 0:
                 return
+
             if not TRADE_REAL:
                 logging.info("[SIM] VENDER %s %.6f", symbol, qty_rounded)
                 return
+
             logging.info("VENDIENDO %s %.6f", symbol, qty_rounded)
             self.client.create_margin_order(
-                symbol=symbol,
-                side="SELL",
-                type="MARKET",
-                quantity=qty_rounded,
+                symbol=symbol, side="SELL", type="MARKET", quantity=qty_rounded
             )
         except Exception as e:
             logging.error("Error al vender %s: %s", symbol, e)
 
-    def _place_margin_market_buy(self, symbol: str, usdc_amount: float):
+    def _place_margin_market_buy(self, symbol, usdc_amount):
         if usdc_amount <= 0:
             return
+
         try:
             ticker = self.client.get_symbol_ticker(symbol=symbol)
             price = float(ticker["price"])
-            base_qty = usdc_amount / price
 
+            base_qty = usdc_amount / price
             lot_step, min_notional = self._get_symbol_filters(symbol)
+
             if usdc_amount < max(min_notional, MIN_NOTIONAL_USD):
-                logging.warning("Capital insuficiente para comprar %s: %.3f USDC", symbol, usdc_amount)
+                logging.warning("Capital insuficiente para %s", symbol)
                 return
 
             qty_rounded = self._round_step(base_qty, lot_step)
+
             if qty_rounded <= 0:
                 return
 
             if not TRADE_REAL:
-                logging.info("[SIM] COMPRAR %s %.6f (≈ %.2f USDC)",
-                             symbol, qty_rounded, usdc_amount)
+                logging.info("[SIM] COMPRAR %s %.6f", symbol, qty_rounded)
                 return
 
-            logging.info("COMPRANDO %s %.6f (≈ %.2f USDC)", symbol, qty_rounded, usdc_amount)
+            logging.info("COMPRANDO %s %.6f", symbol, qty_rounded)
             self.client.create_margin_order(
-                symbol=symbol,
-                side="BUY",
-                type="MARKET",
-                quantity=qty_rounded,
+                symbol=symbol, side="BUY", type="MARKET", quantity=qty_rounded
             )
+
         except Exception as e:
             logging.error("Error al comprar %s: %s", symbol, e)
 
-    # ---------- CORE LOOP ----------
+    # ===================== LOOP =====================
+
     def run(self):
+
         self.stream.start()
-        logging.info("Calentando stream de precios...")
+        logging.info("Calentando 10s...")
         time.sleep(10)
 
         while True:
             try:
+                # FIX 2 → convertir el símbolo actual a USDT para buscar velas
+                if self.current_symbol:
+                    ws_curr = self.current_symbol.replace("USDC", "USDT")
+                else:
+                    ws_curr = None
+
                 if not self.stream.last_change:
-                    logging.info("Aún no hay datos de precios, esperamos 5s...")
+                    logging.info("Esperando datos...")
                     time.sleep(5)
                     continue
 
+                # Buscar mejor moneda (basada en USDT)
                 best_symbol = None
-                best_change = -999.0
-                for sym, pct in self.stream.last_change.items():
-                    if pct > best_change:
+                best_change = -999
+
+                for sym in self.symbols:
+                    ws_sym = sym.replace("USDC", "USDT")
+                    pct = self.stream.last_change.get(ws_sym, None)
+                    if pct is not None and pct > best_change:
                         best_change = pct
-                        best_symbol = sym
+                        best_symbol = sym  # <- devolvemos USDC porque queremos operar USDC
 
                 if best_symbol is None:
-                    logging.info("Sin datos suficientes todavía...")
+                    logging.info("No hay velas aún…")
                     time.sleep(5)
                     continue
 
-                current_change = self.stream.last_change.get(self.current_symbol, 0.0)
-                edge = best_change - current_change
+                curr_change = 0.0
+                if ws_curr:
+                    curr_change = self.stream.last_change.get(ws_curr, 0.0)
+
+                edge = best_change - curr_change
 
                 logging.info(
                     "Actual: %s (%.3f%%) | Mejor: %s (%.3f%%) | Diff=%.3f%%",
-                    self.current_symbol or "USDC",
-                    current_change,
-                    best_symbol,
-                    best_change,
-                    edge,
+                    self.current_symbol or "USDC", curr_change,
+                    best_symbol, best_change, edge
                 )
 
+                # reglas de cambio
                 if edge < EDGE_MIN_DIFF and self.current_symbol == best_symbol:
                     time.sleep(CYCLE_SECONDS)
                     continue
@@ -249,13 +254,10 @@ class CryptoBot:
                     time.sleep(CYCLE_SECONDS)
                     continue
 
+                # --- CAMBIO REAL ---
                 if best_symbol != self.current_symbol:
-                    logging.info("Cambio posible: %s -> %s (edge=%.3f%%)",
-                                 self.current_symbol or "USDC", best_symbol, edge)
 
                     usdc_free, posiciones = self._get_margin_balances()
-                    logging.info("Saldo margen: %.4f USDC | posiciones: %s",
-                                 usdc_free, posiciones)
 
                     if self.current_symbol:
                         base_asset = self.current_symbol.replace("USDC", "")
@@ -267,9 +269,7 @@ class CryptoBot:
                         usdc_free, posiciones = self._get_margin_balances()
 
                     capital = usdc_free * 0.98
-                    if capital < MIN_NOTIONAL_USD:
-                        logging.warning("Capital en USDC demasiado bajo (%.3f). No operamos.", capital)
-                    else:
+                    if capital >= MIN_NOTIONAL_USD:
                         self._place_margin_market_buy(best_symbol, capital)
                         self.current_symbol = best_symbol
 
@@ -279,7 +279,7 @@ class CryptoBot:
                 logging.info("Bot detenido manualmente.")
                 break
             except Exception as e:
-                logging.exception("Error inesperado en el loop: %s", e)
+                logging.exception("Error inesperado: %s", e)
                 time.sleep(10)
 
 
