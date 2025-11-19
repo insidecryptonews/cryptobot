@@ -25,8 +25,8 @@ from binance.exceptions import BinanceAPIException
 # CONFIGURACIÓN
 # ============================
 
-API_KEY = "PON_AQUI_TU_API_KEY"
-API_SECRET = "PON_AQUI_TU_API_SECRET"
+API_KEY = "rbjXqPIinPOyCKfFJMBSgGjL642UENDnvcJDRpXx7u97z1AEmNeUXqQg1NnnxbOP"
+API_SECRET = "e61MGR7vDZqvbOJtJryqGjjAYsqcVkFOn39GOEZOqBvIFobHmeJbmn8aMx3k7bK2"
 
 QUOTE_ASSET = "USDC"
 
