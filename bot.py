@@ -39,7 +39,7 @@ def env_str(name, default=""):
 
 
 # ============================================================
-# CONFIG (MARGEN X3)
+# CONFIG (MARGEN X5)
 # ============================================================
 
 QUOTE_ASSET = "USDC"
@@ -47,9 +47,9 @@ CYCLE_SECONDS = 60
 
 LIVE_TRADING = env_bool("LIVE_TRADING", False)
 
-# 🔥 MARGEN ACTIVADO Y FIJO A X3
+# 🔥 MARGEN ACTIVADO Y FIJO A X5
 USE_MARGIN = True
-MARGIN_LEVERAGE = 3
+MARGIN_LEVERAGE = 5
 MARGIN_MODE = "cross"
 
 # ============================================================
@@ -138,7 +138,7 @@ class BinanceWrapper:
         if px == 0:
             return
 
-        # x3 de margen
+        # x5 de margen
         qty = round(amount_usdc / px * MARGIN_LEVERAGE, 6)
 
         if USE_MARGIN:
@@ -154,7 +154,7 @@ class BinanceWrapper:
                 except BinanceAPIException as e:
                     logger.error(e)
             else:
-                logger.info(f"[SIM MARGIN X3] BUY {qty} {symbol}")
+                logger.info(f"[SIM MARGIN X5] BUY {qty} {symbol}")
         else:
             if LIVE_TRADING:
                 try:
@@ -187,7 +187,7 @@ class BinanceWrapper:
                 except BinanceAPIException as e:
                     logger.error(e)
             else:
-                logger.info(f"[SIM MARGIN X3] SELL {qty} {symbol}")
+                logger.info(f"[SIM MARGIN X5] SELL {qty} {symbol}")
         else:
             qty = self.spot_balance(asset)
             if qty <= 0:
@@ -213,23 +213,21 @@ class CryptoBot:
     def run(self):
         logger.info("=== CICLO NUEVO ===")
 
-        # 🔥 Universo ampliado de monedas USDC
+        # 🔥 Universo seguro de monedas USDC con buen margin
         universe = [
             f"BTC{QUOTE_ASSET}",
             f"ETH{QUOTE_ASSET}",
-            f"SOL{QUOTE_ASSET}",
             f"BNB{QUOTE_ASSET}",
+            f"SOL{QUOTE_ASSET}",
             f"XRP{QUOTE_ASSET}",
-            f"AVAX{QUOTE_ASSET}",
             f"LINK{QUOTE_ASSET}",
-            f"FIL{QUOTE_ASSET}",
             f"ADA{QUOTE_ASSET}",
             f"DOGE{QUOTE_ASSET}",
+            f"AVAX{QUOTE_ASSET}",
             f"NEAR{QUOTE_ASSET}",
             f"ATOM{QUOTE_ASSET}",
             f"DOT{QUOTE_ASSET}",
-            f"SEI{QUOTE_ASSET}",
-            f"INJ{QUOTE_ASSET}",
+            f"FIL{QUOTE_ASSET}",
         ]
 
         best = None
@@ -258,7 +256,7 @@ class CryptoBot:
 # ============================================================
 
 if __name__ == "__main__":
-    logger.info("Iniciando CryptoBot FINAL con MARGEN X3 y universo ampliado")
+    logger.info("Iniciando CryptoBot con MARGEN X5 y universo seguro USDC")
     logger.info(f"Trading real: {LIVE_TRADING}")
     logger.info(f"MARGEN ACTIVADO = {USE_MARGIN}, LEVERAGE = {MARGIN_LEVERAGE}")
 
