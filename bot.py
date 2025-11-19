@@ -1,200 +1,319 @@
 import os
 import time
-import json
-import threading
-import traceback
-from decimal import Decimal
-from binance.client import Client
-from binance.streams import ThreadedWebsocketManager
+import logging
+from decimal import Decimal, ROUND_DOWN
 
-# ============================================================
-# CONFIGURACIÓN DEL BOT
-# ============================================================
+from binance.client import Client
+from binance.websockets import BinanceSocketManager
+from binance.exceptions import BinanceAPIException, BinanceRequestException
+
+# ===================== CONFIG =====================
 
 SYMBOLS = [
-    "BTCUSDC", "ETHUSDC", "BNBUSDC", "SOLUSDC", "XRPUSDC", "LINKUSDC",
-    "ADAUSDC", "DOGEUSDC", "AVAXUSDC", "NEARUSDC", "ATOMUSDC", "DOTUSDC", "FILUSDC"
+    "BTCUSDC", "ETHUSDC", "BNBUSDC", "SOLUSDC", "XRPUSDC",
+    "LINKUSDC", "ADAUSDC", "DOGEUSDC", "AVAXUSDC", "NEARUSDC",
+    "ATOMUSDC", "DOTUSDC", "FILUSDC",
 ]
 
-TIMEFRAME = os.getenv("TIMEFRAME", "15m")
+USDC_ASSET = "USDC"
+
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+
+API_KEY = os.getenv("BINANCE_API_KEY") or os.getenv("BINANCE_KEY") or ""
+API_SECRET = os.getenv("BINANCE_API_SECRET") or os.getenv("BINANCE_SECRET") or ""
+
+TRADE_REAL = os.getenv("TRADING_REAL", "false").lower() == "true"
 USE_MARGIN = os.getenv("USE_MARGIN", "true").lower() == "true"
-LEVERAGE = int(os.getenv("MARGIN_LEVERAGE", "5"))
-REAL = os.getenv("REAL_TRADING", "false").lower() == "true"
+LEVERAGE = int(os.getenv("LEVERAGE", "5"))
+TIMEFRAME = os.getenv("TIMEFRAME", "15m")
+EDGE_MIN_DIFF = float(os.getenv("EDGE_MIN_DIFF", "0.2"))  # diferencia mínima en %
+CYCLE_SECONDS = int(os.getenv("CYCLE_SECONDS", "60"))
 
-EDGE_MIN_DIFF = Decimal("0.20")  # mínimo edge para cambiar
+# Para no liarla con deuda, por ahora NO usamos auto-borrow.
+# Operamos solo con el saldo libre que tengas en margen.
+MIN_NOTIONAL_USD = float(os.getenv("MIN_NOTIONAL_USD", "5"))  # si hay menos que esto, no operamos
 
-# Precio en vivo desde WebSocket
-price_live = {}
 
-# ============================================================
-# WRAPPER BINANCE — solo 1 request por orden, NINGUNA MÁS
-# ============================================================
+# ===================== STREAM DE PRECIOS =====================
 
-class BinanceAPI:
-    def __init__(self):
+class PriceStream:
+    """
+    Mantiene en memoria el % de cambio del último cierre de vela para cada símbolo,
+    usando WebSocket de kline. Anti-ban porque no hacemos peticiones REST para el precio.
+    """
+
+    def __init__(self, client: Client, symbols, interval: str):
+        self.client = client
+        self.symbols = symbols
+        self.interval = interval
+        self._bsm = BinanceSocketManager(client)
+        self.last_change = {}  # symbol -> pct_change
+        self._conns = []
+
+    def _handle_kline(self, msg):
+        """
+        msg['k'] es la vela. Usamos el cierre de la vela anterior (cuando x == True).
+        """
+        if msg.get("e") == "error":
+            logging.error("WebSocket error: %s", msg)
+            return
+
+        data = msg.get("k") or {}
+        is_closed = data.get("x")
+        if not is_closed:
+            return  # solo cuando la vela se cierra, para que sea estable
+
+        symbol = msg.get("s")
         try:
-            self.client = Client(
-                os.getenv("BINANCE_API_KEY"),
-                os.getenv("BINANCE_SECRET_KEY")
-            )
-        except Exception as e:
-            print("Error al iniciar cliente:", e)
-            raise
+            o = float(data["o"])
+            c = float(data["c"])
+        except (KeyError, ValueError, TypeError):
+            return
 
-        if USE_MARGIN:
+        pct = (c - o) / o * 100.0
+        self.last_change[symbol] = pct
+
+    def start(self):
+        for sym in self.symbols:
+            conn_key = self._bsm.start_kline_socket(sym, self._handle_kline, interval=self.interval)
+            self._conns.append(conn_key)
+        self._bsm.start()
+        logging.info("WebSocket de precios iniciado para %d símbolos (%s, timeframe=%s)",
+                     len(self.symbols), ", ".join(self.symbols), self.interval)
+
+    def stop(self):
+        for key in self._conns:
             try:
-                self.client.futures_change_leverage(symbol="BTCUSDT", leverage=LEVERAGE)
-            except:
+                self._bsm.stop_socket(key)
+            except Exception:
                 pass
-
-    # Funcion para operar
-    def buy(self, symbol, qty):
-        if not REAL:
-            print(f"[SIMULACIÓN] BUY {qty} {symbol}")
-            return
-
-        try:
-            order = self.client.create_margin_order(
-                symbol=symbol,
-                side="BUY",
-                type="MARKET",
-                quantity=qty
-            )
-            print("BUY OK:", order)
-        except Exception:
-            traceback.print_exc()
-
-    def sell(self, symbol, qty):
-        if not REAL:
-            print(f"[SIMULACIÓN] SELL {qty} {symbol}")
-            return
-
-        try:
-            order = self.client.create_margin_order(
-                symbol=symbol,
-                side="SELL",
-                type="MARKET",
-                quantity=qty
-            )
-            print("SELL OK:", order)
-        except Exception:
-            traceback.print_exc()
-
-    def get_balance(self):
-        try:
-            data = self.client.get_margin_account()
-            total = Decimal(data["totalAssetOfBtc"])
-            return total
-        except:
-            return Decimal("0")
+        self._bsm.close()
+        logging.info("WebSocket de precios detenido")
 
 
-# ============================================================
-# WEBSOCKET STREAMS — PRECIOS EN VIVO SIN PESAR LA API
-# ============================================================
-
-class PriceStreamer:
-    def __init__(self):
-        self.twm = ThreadedWebsocketManager(
-            api_key=os.getenv("BINANCE_API_KEY"),
-            api_secret=os.getenv("BINANCE_SECRET_KEY")
-        )
-        self.twm.start()
-
-    def stream_price(self, symbol):
-        def handle(msg):
-            if "c" in msg:
-                price_live[symbol] = Decimal(msg["c"])
-
-        self.twm.start_kline_socket(
-            callback=handle,
-            symbol=symbol.lower(),
-            interval="1m"
-        )
-
-    def start_all(self):
-        for s in SYMBOLS:
-            self.stream_price(s)
-
-
-# ============================================================
-# BOT PRINCIPAL
-# ============================================================
+# ===================== LÓGICA DE TRADING =====================
 
 class CryptoBot:
     def __init__(self):
-        self.api = BinanceAPI()
-        self.current_symbol = "USDC"
-        self.position_amount = Decimal("0")
+        if not API_KEY or not API_SECRET:
+            raise RuntimeError("Faltan BINANCE_API_KEY / BINANCE_API_SECRET en variables de entorno")
 
-        self.streamer = PriceStreamer()
-        self.streamer.start_all()
+        self.client = Client(API_KEY, API_SECRET)
 
-        print("STREAMS ACTIVOS. PRECIOS EN TIEMPO REAL.")
-        print("Bot listo. Esperando datos...")
+        self.symbols = SYMBOLS
+        self.current_symbol = None  # símbolo en el que estamos posicionados
+        self.stream = PriceStream(self.client, self.symbols, TIMEFRAME)
 
-    def get_best_symbol(self):
-        """Elige la moneda cuyo precio sube más rápido en los últimos 15m."""
-        if len(price_live) < len(SYMBOLS):
-            return None, Decimal("0")
+        logging.info("Iniciando CryptoBot ANTI-BAN")
+        logging.info("Trading real: %s", TRADE_REAL)
+        logging.info("Margen activado: %s (x%s)", USE_MARGIN, LEVERAGE)
+        logging.info("Timeframe: %s | EDGE_MIN_DIFF: %.3f%%", TIMEFRAME, EDGE_MIN_DIFF)
 
-        # Calculamos diferencias usando precios actuales y precios hace 15 minutos (cache)
-        diffs = {}
+    # ---------- UTILIDADES DE MARGEN ----------
 
-        for symbol in SYMBOLS:
-            now = price_live[symbol]
-            if symbol not in self.history:
-                self.history[symbol] = now
-            old = self.history[symbol]
-            diff = (now - old) / old * 100
-            diffs[symbol] = diff
+    def _get_margin_balances(self):
+        """
+        Devuelve:
+          usdc_free (float),
+          posiciones dict: base_asset -> free_qty
+        """
+        try:
+            acc = self.client.get_margin_account()
+        except BinanceAPIException as e:
+            logging.error("Error al obtener cuenta de margen: %s", e)
+            return 0.0, {}
 
-        best = max(diffs, key=lambda s: diffs[s])
-        return best, diffs[best]
+        usdc_free = 0.0
+        posiciones = {}
+        for asset in acc.get("userAssets", []):
+            asset_name = asset.get("asset")
+            free = float(asset.get("free", "0"))
+            if asset_name == USDC_ASSET:
+                usdc_free = free
+            else:
+                if free > 0:
+                    posiciones[asset_name] = free
+        return usdc_free, posiciones
 
-    def loop(self):
-        self.history = {}
-        print("Esperando 1 minuto para cargar precios iniciales...")
-        time.sleep(60)
+    def _round_step(self, quantity: float, step: str) -> float:
+        """
+        Redondea la cantidad a múltiplos del 'stepSize' que viene en los filtros de LOT_SIZE.
+        """
+        step_dec = Decimal(step)
+        q = Decimal(quantity)
+        return float(q.quantize(step_dec, rounding=ROUND_DOWN).normalize())
+
+    def _get_symbol_filters(self, symbol: str):
+        info = self.client.get_symbol_info(symbol)
+        lot_step = "0.000001"
+        min_notional = 10.0
+        for f in info.get("filters", []):
+            if f.get("filterType") == "LOT_SIZE":
+                lot_step = f.get("stepSize", lot_step)
+            if f.get("filterType") == "MIN_NOTIONAL":
+                try:
+                    min_notional = float(f.get("minNotional", min_notional))
+                except (TypeError, ValueError):
+                    pass
+        return lot_step, min_notional
+
+    def _place_margin_market_sell(self, symbol: str, base_qty: float):
+        if base_qty <= 0:
+            return
+        try:
+            lot_step, _ = self._get_symbol_filters(symbol)
+            qty_rounded = self._round_step(base_qty, lot_step)
+            if qty_rounded <= 0:
+                logging.warning("Cantidad a vender demasiado pequeña en %s", symbol)
+                return
+            if not TRADE_REAL:
+                logging.info("[SIM] VENDER %s %.6f", symbol, qty_rounded)
+                return
+            logging.info("VENDIENDO %s %.6f (margen)", symbol, qty_rounded)
+            self.client.create_margin_order(
+                symbol=symbol,
+                side="SELL",
+                type="MARKET",
+                quantity=qty_rounded,
+            )
+        except (BinanceAPIException, BinanceRequestException) as e:
+            logging.error("Error al vender %s: %s", symbol, e)
+
+    def _place_margin_market_buy(self, symbol: str, usdc_amount: float):
+        if usdc_amount <= 0:
+            return
+        try:
+            # Obtenemos precio de mercado rápido (1 llamada REST por cambio de moneda).
+            ticker = self.client.get_symbol_ticker(symbol=symbol)
+            price = float(ticker["price"])
+            base_qty = usdc_amount / price
+
+            lot_step, min_notional = self._get_symbol_filters(symbol)
+            if usdc_amount < max(min_notional, MIN_NOTIONAL_USD):
+                logging.warning(
+                    "Capital insuficiente para comprar %s: %.3f USDC (min %.3f)",
+                    symbol, usdc_amount, max(min_notional, MIN_NOTIONAL_USD),
+                )
+                return
+
+            qty_rounded = self._round_step(base_qty, lot_step)
+            if qty_rounded <= 0:
+                logging.warning("Cantidad a comprar demasiado pequeña en %s", symbol)
+                return
+
+            if not TRADE_REAL:
+                logging.info("[SIM] COMPRAR %s %.6f (≈ %.2f USDC)", symbol, qty_rounded, usdc_amount)
+                return
+
+            logging.info("COMPRANDO %s %.6f (≈ %.2f USDC, margen sin deuda)",
+                         symbol, qty_rounded, usdc_amount)
+            self.client.create_margin_order(
+                symbol=symbol,
+                side="BUY",
+                type="MARKET",
+                quantity=qty_rounded,
+            )
+        except (BinanceAPIException, BinanceRequestException) as e:
+            logging.error("Error al comprar %s: %s", symbol, e)
+
+    # ---------- CORE LOOP ----------
+
+    def run(self):
+        # Iniciar WebSocket
+        self.stream.start()
+
+        # Pequeño warm-up
+        logging.info("Calentando stream de precios...")
+        time.sleep(10)
 
         while True:
             try:
-                best_symbol, diff = self.get_best_symbol()
-                if not best_symbol:
-                    print("Aún no hay stream completo...")
+                if not self.stream.last_change:
+                    logging.info("Aún no hay datos de precios, esperamos 5s...")
                     time.sleep(5)
                     continue
 
-                print(f"Mejor moneda ahora: {best_symbol} ({diff:.2f}%)")
+                # Buscar mejor símbolo según % de cambio de la última vela cerrada
+                best_symbol = None
+                best_change = -999.0
+                for sym, pct in self.stream.last_change.items():
+                    if pct > best_change:
+                        best_change = pct
+                        best_symbol = sym
 
-                # Condición cambio
-                if self.current_symbol != best_symbol and abs(diff) >= EDGE_MIN_DIFF:
-                    print(f"CAMBIO → {best_symbol} (diff {diff:.2f}%)")
+                if best_symbol is None:
+                    logging.info("Sin datos suficientes todavía, esperamos...")
+                    time.sleep(5)
+                    continue
 
-                    if self.position_amount > 0 and self.current_symbol != "USDC":
-                        self.api.sell(self.current_symbol, float(self.position_amount))
+                current_change = self.stream.last_change.get(self.current_symbol, 0.0)
+                edge = best_change - current_change
 
-                    balance = self.api.get_balance()
-                    qty = float(balance * LEVERAGE)
+                logging.info(
+                    "Actual: %s (%.3f%%) | Mejor: %s (%.3f%%) | Diff=%.3f%%",
+                    self.current_symbol or "USDC",
+                    current_change,
+                    best_symbol,
+                    best_change,
+                    edge,
+                )
 
-                    self.api.buy(best_symbol, qty)
+                # Si no supera el umbral, no hacemos nada
+                if edge < EDGE_MIN_DIFF and self.current_symbol == best_symbol:
+                    logging.info("No cambiamos: edge %.3f%% < %.3f%% o ya estamos en %s",
+                                 edge, EDGE_MIN_DIFF, best_symbol)
+                    time.sleep(CYCLE_SECONDS)
+                    continue
 
-                    self.position_amount = qty
-                    self.current_symbol = best_symbol
-                else:
-                    print("Sin cambio. Mercado estable.")
+                if edge < EDGE_MIN_DIFF and self.current_symbol is None:
+                    logging.info("Aún no merece la pena entrar; edge=%.3f%% < %.3f%%", edge, EDGE_MIN_DIFF)
+                    time.sleep(CYCLE_SECONDS)
+                    continue
 
-            except Exception:
-                traceback.print_exc()
+                # Si llegamos aquí y best_symbol es diferente, planteamos cambio
+                if best_symbol != self.current_symbol:
+                    logging.info("Posible cambio de moneda: %s -> %s (edge=%.3f%%)",
+                                 self.current_symbol or "USDC", best_symbol, edge)
 
-            time.sleep(60)  # 1 ciclo por minuto usando websockets (ligero)
+                    usdc_free, posiciones = self._get_margin_balances()
+                    logging.info("Saldo margen: %.4f %s | posiciones: %s",
+                                 usdc_free, USDC_ASSET, posiciones)
 
+                    # 1) vender posición anterior si existe
+                    if self.current_symbol:
+                        base_asset = self.current_symbol.replace(USDC_ASSET, "")
+                        base_qty = posiciones.get(base_asset, 0.0)
+                        if base_qty > 0:
+                            self._place_margin_market_sell(self.current_symbol, base_qty)
+                        else:
+                            logging.info("No hay %s para vender", base_asset)
 
-# ============================================================
-# MAIN
-# ============================================================
+                        # refrescar balances tras venta
+                        time.sleep(2)
+                        usdc_free, posiciones = self._get_margin_balances()
+
+                    # 2) comprar nueva moneda con prácticamente todo el USDC
+                    capital = usdc_free * 0.98  # dejamos un pequeño margen para comisiones
+                    if capital < MIN_NOTIONAL_USD:
+                        logging.warning("Capital en USDC demasiado bajo (%.3f). No operamos.", capital)
+                    else:
+                        self._place_margin_market_buy(best_symbol, capital)
+                        self.current_symbol = best_symbol
+
+                time.sleep(CYCLE_SECONDS)
+
+            except KeyboardInterrupt:
+                logging.info("Bot detenido manualmente (Ctrl+C).")
+                break
+            except Exception as e:
+                logging.exception("Error inesperado en el loop principal: %s", e)
+                time.sleep(10)
+
 
 if __name__ == "__main__":
-    print("Iniciando CRYPTOBOT WEBSOCKET EDITION (ANTI-BAN)")
     bot = CryptoBot()
-    bot.loop()
+    bot.run()
