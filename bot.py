@@ -213,12 +213,23 @@ class CryptoBot:
     def run(self):
         logger.info("=== CICLO NUEVO ===")
 
+        # 🔥 Universo ampliado de monedas USDC
         universe = [
             f"BTC{QUOTE_ASSET}",
             f"ETH{QUOTE_ASSET}",
             f"SOL{QUOTE_ASSET}",
             f"BNB{QUOTE_ASSET}",
-            f"XRP{QUOTE_ASSET}"
+            f"XRP{QUOTE_ASSET}",
+            f"AVAX{QUOTE_ASSET}",
+            f"LINK{QUOTE_ASSET}",
+            f"FIL{QUOTE_ASSET}",
+            f"ADA{QUOTE_ASSET}",
+            f"DOGE{QUOTE_ASSET}",
+            f"NEAR{QUOTE_ASSET}",
+            f"ATOM{QUOTE_ASSET}",
+            f"DOT{QUOTE_ASSET}",
+            f"SEI{QUOTE_ASSET}",
+            f"INJ{QUOTE_ASSET}",
         ]
 
         best = None
@@ -247,7 +258,7 @@ class CryptoBot:
 # ============================================================
 
 if __name__ == "__main__":
-    logger.info("Iniciando CryptoBot FINAL con MARGEN X3")
+    logger.info("Iniciando CryptoBot FINAL con MARGEN X3 y universo ampliado")
     logger.info(f"Trading real: {LIVE_TRADING}")
     logger.info(f"MARGEN ACTIVADO = {USE_MARGIN}, LEVERAGE = {MARGIN_LEVERAGE}")
 
