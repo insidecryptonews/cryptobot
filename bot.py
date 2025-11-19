@@ -9,9 +9,11 @@ from binance.exceptions import BinanceAPIException, BinanceRequestException
 # ===================== CONFIG =====================
 
 SYMBOLS = [
-    "BTCUSDC", "ETHUSDC", "BNBUSDC", "SOLUSDC", "XRPUSDC",
-    "LINKUSDC", "ADAUSDC", "DOGEUSDC", "AVAXUSDC", "NEARUSDC",
-    "ATOMUSDC", "DOTUSDC", "FILUSDC",
+    "SOLUSDC", "XRPUSDC",
+    "ADAUSDC", "DOGEUSDC",
+    "AVAXUSDC", "NEARUSDC",
+    "ATOMUSDC", "DOTUSDC",
+    "FILUSDC",
 ]
 
 USDC_ASSET = "USDC"
@@ -116,7 +118,7 @@ class CryptoBot:
 
     def _sell_all(self, symbol, positions):
         base_asset = symbol.replace("USDC", "")
-        base_qty = positions.get(base_asset, 0.0)
+        base_qty = posiciones.get(base_asset, 0.0)
 
         if base_qty <= 0:
             return
@@ -192,8 +194,8 @@ class CryptoBot:
             self.client.create_margin_order(
                 symbol=symbol,
                 side="BUY",
-                type="MARKET",
                 quantity=qty,
+                type="MARKET",
             )
             return True
         except Exception as e:
